@@ -126,7 +126,7 @@ export default function App() {
       log(`🎤 STT: ${text}`);
     }
 
-    // Gom LLM response
+    // Gom LLM response. Mỗi chunk là 1 word delta → append để xây câu hoàn chỉnh.
     if (newState === 'speaking') {
       if (emo) setEmotion(emo);
       if (text) {
@@ -139,9 +139,18 @@ export default function App() {
       }
     }
 
-    // Cập nhật state
+    // Cập nhật state. Listening frame cuối turn mang full_response_text → REPLACE
+    // (không append) để tránh ghép với text delta trước đó. Cách này tránh được
+    // lặp/tách vụn khi backend streaming delta.
     if (newState === 'listening') {
       setState('listening');
+      if (text && text !== 'Sẵn sàng lắng nghe tiếp') {
+        // Full response từ backend (đã chuẩn hóa, không bị lặp)
+        setAssistantText(text);
+      } else {
+        // Không có full text (vd turn ngắn hoặc lỗi) → reset để tránh lưu cũ
+        setAssistantText('');
+      }
       if (msg.latency_ms) {
         log(`⏱️ Total latency: ${Math.round(msg.latency_ms)} ms`);
       }
@@ -252,11 +261,13 @@ export default function App() {
       }
       // Tạo data URI từ base64
       const dataUri = `data:audio/mp3;base64,${audioB64}`;
-      const { sound } = await Audio.Sound.createFromURI(dataUri, {
-        shouldPlay: true,
-      });
+      // expo-av SDK 54 dùng createAsync (createFromURI deprecated).
+      // { shouldPlay: true } phát ngay khi load xong; không cần gọi playAsync() thêm.
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: dataUri },
+        { shouldPlay: true }
+      );
       soundRef.current = sound;
-      await sound.playAsync();
     } catch (e) {
       log(`❌ Audio play error: ${String(e)}`);
     }
