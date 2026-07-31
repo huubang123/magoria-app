@@ -112,7 +112,7 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
     func startRecording() {
         guard !isRecording else { return }
 
-        AVAudioApplication.requestRecordPermission { [weak self] granted in
+        let handlePermission: (Bool) -> Void = { [weak self] granted in
             DispatchQueue.main.async {
                 guard granted else {
                     self?.log("❌ Không có quyền microphone")
@@ -121,12 +121,22 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
                 self?.beginRecording()
             }
         }
+
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { granted in
+                handlePermission(granted)
+            }
+        } else {
+            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                handlePermission(granted)
+            }
+        }
     }
 
     private func beginRecording() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
             log("❌ AVAudioSession error: \(error)")
