@@ -20,6 +20,7 @@
 //
 
 import { Audio } from 'expo-av';
+import * as FileSystem from 'expo-file-system/legacy';
 import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useRef, useState } from 'react';
 import {
@@ -36,7 +37,7 @@ import {
 //   EXPO_PUBLIC_WS_URL=ws://192.168.1.50:8765/ws/ npx expo start
 const WS_URL: string =
   process.env.EXPO_PUBLIC_WS_URL ||
-  'ws://192.168.1.100:8765/ws/?session_id=expo-test&character_id=default&character_type=default';
+  'ws://192.168.1.5:8765/ws/?session_id=expo-test&character_id=default&character_type=default';
 
 // State machine của backend
 type State = 'connecting' | 'listening' | 'thinking' | 'speaking' | 'error';
@@ -55,6 +56,10 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const playbackQueueRef = useRef<string[]>([]);
+  const isPlayingRef = useRef(false);
+  const playbackRunIdRef = useRef(0);
+  const audioFileCounterRef = useRef(0);
 
   // === Logging ===
   const log = (msg: string) => {
@@ -129,13 +134,13 @@ export default function App() {
     // Gom LLM response. Mỗi chunk là 1 word delta → append để xây câu hoàn chỉnh.
     if (newState === 'speaking') {
       if (emo) setEmotion(emo);
-      if (text) {
+      if (text && !audioB64) {
         setAssistantText((prev) => (prev ? prev + ' ' + text : text));
         log(`🤖 LLM[${emo || '—'}]: ${text}`);
       }
       // Phát audio
       if (audioB64) {
-        playAudio(audioB64);
+        enqueueAudio(audioB64);
       }
     }
 
@@ -177,8 +182,13 @@ export default function App() {
         playsInSilentModeIOS: true,
       });
 
-      // expo-av HIGH_QUALITY preset ghi M4A/AAC. Backend cần WAV/MP3.
-      // Hiện backend có thể chưa nhận M4A — cần test. Nếu fail, sẽ dùng PCM streaming.
+      if (state === 'speaking') {
+        await clearPlaybackQueue();
+      }
+
+      // expo-av HIGH_QUALITY preset ghi M4A/AAC.
+      // Backend STT (faster-whisper) tự động decode M4A/MP4/WebM/MP3/OGG/WAV
+      // về PCM 16kHz mono qua ffmpeg — không cần convert ở app.
       const rec = new Audio.Recording();
       await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
       await rec.startAsync();
@@ -210,15 +220,10 @@ export default function App() {
       }
 
       // Đọc file -> base64
-      const resp = await fetch(uri);
-      const blob = await resp.blob();
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
-        const base64 = dataUrl.split(',')[1];
-        sendAudioFrame(base64);
-      };
-      reader.readAsDataURL(blob);
+      const base64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      sendAudioFrame(base64);
     } catch (e) {
       log(`❌ stopRecording error: ${String(e)}`);
     }
@@ -252,28 +257,80 @@ export default function App() {
   };
 
   // === Phát audio TTS từ server ===
-  const playAudio = async (audioB64: string) => {
+  const clearPlaybackQueue = async () => {
+    playbackRunIdRef.current += 1;
+    playbackQueueRef.current = [];
+    isPlayingRef.current = false;
+    const sound = soundRef.current;
+    soundRef.current = null;
+    if (sound) {
+      await sound.unloadAsync().catch(() => {});
+    }
+  };
+
+  const enqueueAudio = (audioB64: string) => {
+    playbackQueueRef.current.push(audioB64);
+    void playNextAudio();
+  };
+
+  const playNextAudio = async () => {
+    if (isPlayingRef.current) return;
+    const audioB64 = playbackQueueRef.current.shift();
+    if (!audioB64) return;
+    isPlayingRef.current = true;
+    await playAudio(audioB64, playbackRunIdRef.current);
+  };
+
+  const playAudio = async (audioB64: string, runId: number) => {
     try {
       // Dừng audio đang phát
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync().catch(() => {});
-        soundRef.current = null;
-      }
       // Tạo data URI từ base64
-      const dataUri = `data:audio/mp3;base64,${audioB64}`;
+      const cacheDirectory = FileSystem.cacheDirectory;
+      if (!cacheDirectory) {
+        throw new Error('Audio cache directory is unavailable');
+      }
+      const fileUri = `${cacheDirectory}magoria-tts-${audioFileCounterRef.current++}.mp3`;
+      await FileSystem.writeAsStringAsync(fileUri, audioB64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+      });
       // expo-av SDK 54 dùng createAsync (createFromURI deprecated).
       // { shouldPlay: true } phát ngay khi load xong; không cần gọi playAsync() thêm.
       const { sound } = await Audio.Sound.createAsync(
-        { uri: dataUri },
+        { uri: fileUri },
         { shouldPlay: true }
       );
+      if (runId !== playbackRunIdRef.current) {
+        await sound.unloadAsync();
+        await FileSystem.deleteAsync(fileUri, { idempotent: true });
+        return;
+      }
       soundRef.current = sound;
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          void finishPlayback(sound, fileUri, runId);
+        }
+      });
     } catch (e) {
       log(`❌ Audio play error: ${String(e)}`);
     }
   };
 
   // === UI ===
+  const finishPlayback = async (sound: Audio.Sound, fileUri: string, runId: number) => {
+    if (soundRef.current === sound) {
+      soundRef.current = null;
+    }
+    await sound.unloadAsync().catch(() => {});
+    await FileSystem.deleteAsync(fileUri, { idempotent: true }).catch(() => {});
+    if (runId !== playbackRunIdRef.current) return;
+    isPlayingRef.current = false;
+    void playNextAudio();
+  };
+
   const stateColor = (s: State): string => {
     switch (s) {
       case 'listening': return '#4CAF50'; // xanh lá
