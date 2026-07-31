@@ -2,80 +2,116 @@
 //  ContentView.swift
 //  MagoriaVoiceTest
 //
-//  App iOS SwiftUI tối giản để test luồng real-time với core Magoria:
-//   - Mở WebSocket tới core (ws://localhost:8765/ws/...)
-//   - Nhấn nút 🎤 để thu âm mic -> gửi audio frame
-//   - Nhận response: phát audio TTS + log transcript/response/emotion
-//   - Barge-in: trong khi core đang phát -> nếu user nói -> gửi frame "interrupt" ngay
-//   - Realtime: nói xong -> gửi audio -> server xử lý -> trả audio
+//  App iOS SwiftUI tối giản để test luồng real-time với core Magoria.
+//  Dùng URLSessionWebSocketTask (iOS 13+, built-in, không cần package ngoài).
 //
 //  Cách dùng:
 //   1. Tạo project iOS mới (File -> New -> Project -> iOS -> App, SwiftUI)
-//   2. Đặt file này thành ContentView.swift (thay thế file mặc định)
-//   3. Chạy trên simulator/device. Nhấn nút 🎤 để thu âm, nhấn lần nữa để gửi.
-//   4. Cấp quyền microphone khi iOS hỏi.
-//   5. Đảm bảo core backend đang chạy ở localhost:8765 (chạy trên máy Mac, hoặc dùng IP máy Mac nếu test trên iPhone thật).
-//
-//  Lưu ý:
-//   - App chỉ ghi 1 turn audio mỗi lần nhấn (nhấn -> nói -> nhấn lại -> gửi). Để real-time streaming thì cần thêm logic ghi liên tục.
-//   - Barge-in: nếu đang nghe audio TTS từ server -> nhấn 🎤 -> gửi "interrupt" -> server dừng. Đây là demo đơn giản.
+//   2. Replace file ContentView.swift mặc định bằng file này
+//   3. Chạy trên simulator/iPhone. Nhấn 🎤 để thu âm, nhấn lại để gửi.
+//   4. Info.plist cần thêm: NSMicrophoneUsageDescription = "Cần mic để nói chuyện"
+//   5. Core backend phải chạy ở host:port (mặc định localhost:8765).
 //
 
 import SwiftUI
 import AVFoundation
-import Starscream   // WebSocket client. Nếu chưa có: File -> Add Packages... -> https://github.com/daltoniam/Starscream
+import Foundation
 
 // MARK: - Cấu hình
-// Khi test trên SIMULATOR (chạy iPhone trên Mac): để "localhost"
-// Khi test trên iPhone THẬT (iOS device kết nối cùng WiFi với Mac chạy core):
-//   đổi thành IP máy Mac. Tìm IP: System Settings -> Wi-Fi -> Details -> IP Address
-//   vd "192.168.1.100". Hoặc dùng hostname Mac.local vd "macbook.local"
+// Simulator: để "localhost" là được (chạy trên Mac cùng máy với backend).
+// iPhone thật: đổi thành IP máy Mac (vd "192.168.1.100"). Hoặc dùng Scheme env var MAGORIA_HOST.
 private let kServerHost = ProcessInfo.processInfo.environment["MAGORIA_HOST"] ?? "localhost"
 private let kServerPort = Int(ProcessInfo.processInfo.environment["MAGORIA_PORT"] ?? "8765") ?? 8765
-private let kServerWSURL = "ws://\(kServerHost):\(kServerPort)/ws/?session_id=ios-test&character_id=default&character_type=default"
+private let kServerWSURL: String = "ws://\(kServerHost):\(kServerPort)/ws/?session_id=ios-test&character_id=default&character_type=default"
 
 // MARK: - ViewModel
 @MainActor
 final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
     @Published var isConnected = false
-    @Published var isRecording = false          // đang thu âm mic
-    @Published var isPlaying = false            // đang phát audio TTS từ server
-    @Published var statusText = "Nhấn 🎤 để thu âm"
+    @Published var isRecording = false
+    @Published var isPlaying = false
+    @Published var statusText = "Đang kết nối..."
     @Published var logText: [String] = []
-    @Published var sttText = ""                 // transcript từ server
-    @Published var llmText = ""                 // response text từ LLM
-    @Published var emotionText = "—"            // emotion hiện tại
+    @Published var sttText = ""
+    @Published var llmText = ""
+    @Published var emotionText = "—"
 
-    private var ws: WebSocket?
+    private var wsTask: URLSessionWebSocketTask?
+    private var wsSession: URLSession?
     private var recorder: AVAudioRecorder?
     private var player: AVAudioPlayer?
     private var recordedFileURL: URL?
 
     // MARK: - WebSocket lifecycle
     func connect() {
-        guard ws == nil else { return }
+        guard wsTask == nil else { return }
         log("Đang kết nối \(kServerWSURL)")
-        var req = URLRequest(url: URL(string: kServerWSURL)!)
-        let socket = WebSocket(request: req)
-        socket.delegate = self
-        socket.connect()
-        ws = socket
+        let url = URL(string: kServerWSURL)!
+        let config = URLSessionConfiguration.default
+        let session = URLSession(configuration: config)
+        let task = session.webSocketTask(with: url)
+        task.resume()
+        wsTask = task
+        wsSession = session
+        receiveLoop()
     }
 
     func disconnect() {
-        ws?.disconnect()
-        ws = nil
+        wsTask?.cancel(with: .normalClosure, reason: nil)
+        wsTask = nil
+        wsSession = nil
         isConnected = false
         stopRecording()
         stopPlaying()
+    }
+
+    private func receiveLoop() {
+        wsTask?.receive { [weak self] result in
+            guard let self = self else { return }
+            Task { @MainActor in
+                switch result {
+                case .success(let message):
+                    self.isConnected = true
+                    if self.statusText == "Đang kết nối..." {
+                        self.statusText = "Đã kết nối. Nhấn 🎤 để nói."
+                    }
+                    switch message {
+                    case .string(let text):
+                        self.handleServerFrame(text)
+                    case .data(let data):
+                        if let s = String(data: data, encoding: .utf8) {
+                            self.handleServerFrame(s)
+                        }
+                    @unknown default: break
+                    }
+                    // tiếp tục nhận
+                    self.receiveLoop()
+                case .failure(let error):
+                    self.isConnected = false
+                    self.statusText = "Mất kết nối. Bấm Kết nối lại."
+                    self.log("⚠️ Mất kết nối WS: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func sendWS(_ text: String) {
+        guard let task = wsTask else { return }
+        let msg = URLSessionWebSocketTask.Message.string(text)
+        task.send(msg) { [weak self] error in
+            if let error = error {
+                Task { @MainActor in
+                    self?.log("❌ WS send error: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     // MARK: - Recording
     func startRecording() {
         guard !isRecording else { return }
 
-        // Xin quyền mic
         AVAudioApplication.requestRecordPermission { [weak self] granted in
             DispatchQueue.main.async {
                 guard granted else {
@@ -103,8 +139,8 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
 
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: 16000.0,           // core dùng 16k/24kHz, 16k đủ
-            AVNumberOfChannelsKey: 1,            // mono
+            AVSampleRateKey: 16000.0,
+            AVNumberOfChannelsKey: 1,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsFloatKey: false
@@ -119,7 +155,6 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
             isRecording = true
             log("🎤 Đang thu âm... nhấn lại để gửi.")
 
-            // Barge-in: nếu đang phát audio TTS -> gửi interrupt ngay
             if isPlaying {
                 sendInterrupt()
             }
@@ -144,7 +179,7 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
     }
 
     private func sendAudioFrame(wavBytes: Data) {
-        guard let ws = ws, isConnected else {
+        guard isConnected else {
             log("❌ Chưa kết nối WS")
             return
         }
@@ -155,25 +190,27 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
             "event_type": "audio",
             "payload": payloadDict
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: frame) {
-            ws.write(data: data)
+        if let data = try? JSONSerialization.data(withJSONObject: frame),
+           let s = String(data: data, encoding: .utf8) {
+            sendWS(s)
             statusText = "Đang gửi audio..."
         }
     }
 
     private func sendInterrupt() {
-        guard let ws = ws, isConnected else { return }
+        guard isConnected else { return }
         log("⛔ Barge-in: gửi interrupt")
         let frame: [String: Any] = [
             "type": "event",
             "event_type": "interrupt"
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: frame) {
-            ws.write(data: data)
+        if let data = try? JSONSerialization.data(withJSONObject: frame),
+           let s = String(data: data, encoding: .utf8) {
+            sendWS(s)
         }
     }
 
-    // MARK: - Playback (TTS từ server)
+    // MARK: - Playback
     private func playAudio(audioB64: String) {
         guard let data = Data(base64Encoded: audioB64) else { return }
         do {
@@ -195,42 +232,8 @@ final class VoiceViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate 
         isPlaying = false
     }
 
-    // MARK: - Logging
-    private func log(_ msg: String) {
-        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        logText.append("[\(ts)] \(msg)")
-        if logText.count > 50 { logText.removeFirst(logText.count - 50) }
-    }
-}
-
-// MARK: - WebSocket delegate
-extension VoiceViewModel: WebSocketDelegate {
-    nonisolated func didReceive(event: WebSocketEvent, client: WebSocketClient) {
-        Task { @MainActor in
-            switch event {
-            case .connected:
-                self.isConnected = true
-                self.statusText = "Đã kết nối. Nhấn 🎤 để nói."
-                self.log("✅ Kết nối thành công")
-            case .disconnected, .cancelled:
-                self.isConnected = false
-                self.statusText = "Mất kết nối. Bấm Kết nối lại."
-                self.log("⚠️ Mất kết nối WS")
-            case .text(let s):
-                self.handleServerFrame(json: s)
-            case .binary(let d):
-                if let s = String(data: d, encoding: .utf8) {
-                    self.handleServerFrame(json: s)
-                }
-            case .error(let e):
-                self.log("❌ WS error: \(String(describing: e))")
-            default:
-                break
-            }
-        }
-    }
-
-    private func handleServerFrame(json: String) {
+    // MARK: - Server frame handler
+    private func handleServerFrame(_ json: String) {
         guard let data = json.data(using: .utf8) else { return }
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
@@ -249,7 +252,7 @@ extension VoiceViewModel: WebSocketDelegate {
         case "speaking":
             if let e = emotion { emotionText = e }
             if let t = text, !t.isEmpty {
-                llmText += (llmText.isEmpty ? "" : " ") + t
+                if llmText.isEmpty { llmText = t } else { llmText += " " + t }
                 log("🤖 LLM[\(emotion ?? "—")]: \(t)")
             }
             if let a = audioB64, !a.isEmpty {
@@ -257,17 +260,23 @@ extension VoiceViewModel: WebSocketDelegate {
             }
         case "listening":
             statusText = "Sẵn sàng lắng nghe. Nhấn 🎤."
-            let lat = obj["latency_ms"] as? Double
-            if let l = lat {
-                log("⏱️ Total latency: \(Int(l)) ms")
+            if let lat = obj["latency_ms"] as? Double {
+                log("⏱️ Total latency: \(Int(lat)) ms")
             }
         default:
             break
         }
     }
+
+    // MARK: - Logging
+    private func log(_ msg: String) {
+        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        logText.append("[\(ts)] \(msg)")
+        if logText.count > 50 { logText.removeFirst(logText.count - 50) }
+    }
 }
 
-// MARK: - Audio recorder delegate
+// MARK: - Audio recorder / player delegate
 extension VoiceViewModel: AVAudioPlayerDelegate {
     nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         Task { @MainActor in
@@ -291,7 +300,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            // Header
             Text("Magoria Voice Test")
                 .font(.title).bold()
 
@@ -332,7 +340,6 @@ struct ContentView: View {
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
 
-            // Transcript + LLM + Emotion
             VStack(alignment: .leading, spacing: 4) {
                 Text("🎤 Bạn nói:").font(.caption).bold()
                 Text(vm.sttText).font(.callout).foregroundColor(.blue)
@@ -345,7 +352,6 @@ struct ContentView: View {
 
             Divider()
 
-            // Log
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(vm.logText.enumerated()), id: \.offset) { _, line in
@@ -359,9 +365,7 @@ struct ContentView: View {
             .cornerRadius(8)
         }
         .padding()
-        .onAppear {
-            vm.connect()
-        }
+        .onAppear { vm.connect() }
     }
 }
 

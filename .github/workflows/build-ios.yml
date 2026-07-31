@@ -22,14 +22,6 @@ jobs:
           sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
 
-      - name: Cache Starscream
-        uses: actions/cache@v4
-        with:
-          path: ios/MagoriaVoiceTest.xcworkspace/xcuserdata
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
-
       # Tạo Xcode project từ thư mục ios/. (GitHub Actions dùng XcodeGen)
       - name: Install XcodeGen
         run: brew install xcodegen

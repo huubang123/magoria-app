@@ -14,18 +14,12 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: 15.0
     MARKETING_VERSION: 0.1.0
     CURRENT_PROJECT_VERSION: 1
-packages:
-  Starscream:
-    url: https://github.com/daltoniam/Starscream
-    from: 4.0.6
 targets:
   MagoriaVoiceTest:
     type: application
     platform: iOS
     sources:
       - path: MagoriaVoiceTest
-    dependencies:
-      - package: Starscream
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.magoria.MagoriaVoiceTest
