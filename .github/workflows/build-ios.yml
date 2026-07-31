@@ -1,0 +1,64 @@
+# GitHub Actions: build iOS app (.ipa) từ SwiftUI code.
+# Trigger khi push lên main.
+name: Build iOS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: Cache Starscream
+        uses: actions/cache@v4
+        with:
+          path: MagoriaVoiceTest.xcworkspace/xcuserdata
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      # Tạo Xcode project từ thư mục ios/. (GitHub Actions dùng XcodeGen)
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: |
+          cd ios
+          xcodegen generate --spec project.yml
+
+      - name: Build
+        run: |
+          xcodebuild \
+            -project MagoriaVoiceTest.xcodeproj \
+            -scheme MagoriaVoiceTest \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/MagoriaVoiceTest.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+
+      - name: Export IPA
+        run: |
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/MagoriaVoiceTest.xcarchive \
+            -exportPath build \
+            -exportOptionsPlist ExportOptions.plist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MagoriaVoiceTest-IPA
+          path: build/MagoriaVoiceTest.ipa
