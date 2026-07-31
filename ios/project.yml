@@ -24,17 +24,17 @@ targets:
     platform: iOS
     sources:
       - path: MagoriaVoiceTest
-    info:
-      path: Info.plist
-      properties:
-        NSMicrophoneUsageDescription: Cần mic để nói chuyện với core backend
-        UILaunchScreen: {}
-        UISupportedInterfaceOrientations:
-          - UIInterfaceOrientationPortrait
     dependencies:
       - package: Starscream
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.magoria.MagoriaVoiceTest
         TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
-        GENERATE_INFOPLIST_FILE: NO
+        # Xcode tự sinh Info.plist từ các key dưới (không cần file Info.plist thật)
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Cần mic để nói chuyện với core backend"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        INFOPLIST_KEY_CFBundleDisplayName: "Magoria"
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
